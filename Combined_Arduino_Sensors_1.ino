@@ -1,281 +1,229 @@
-//RTC + SERVO TRAY + PULSE SENSOR + TEMPERATURE SENSORS + LCD (ESP AND FIREBASE YET TO FINISH)
+//WHATS LEFT: We have yet to only add the esp 8266 to this code and integrate the values of the heart rate and temperature sensors with the mobile app using firebase.
 
-#include <Wire.h>
+#include <Wire.h> 
 #include <LiquidCrystal_I2C.h>
-#include <RtcDS3231.h>
-#include <Servo.h>
-#include <SoftwareSerial.h>
 
-float getInitialTemperature();
-float getKalmanFilteredTemp();
-void interruptSetup();
-void activateServo();
-void serialOutputWhenBeatHappens();
-void printTime(const RtcDateTime& dt);
+#define BUZZER_PIN 8 
+#define PULSE_TIMEOUT 3000  
 
-// LCD Configuration
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-// ESP Communication
-SoftwareSerial espSerial(10, 4);
+int tempPin = A1; 
 
-// RTC and Servo
-RtcDS3231<TwoWire> Rtc(Wire);
-Servo myservo;
-const int SERVO_PIN = 13;
-const int TRIGGER_HOUR = 9;
-const int TRIGGER_MINUTE = 45;
-const int TRAY_HOLD_TIME = 30000;
-bool servoActivated = false;
-unsigned long lastActivation = 0;
+int pulsePin = 0; 
+volatile int BPM;
+volatile boolean QS = false;
 
-// Temperature Sensor
-int tempPin = A1;
-float tempEstimate;
-const float kalmanGain = 0.05;
-float tempSmooth = 0;
-const int numReadings = 20;
-float tempReadings[numReadings];
+// Kalman Filter variables
+float tempEstimate; 
+float kalmanGain = 0.07;    
+float tempSmooth = 0;   
+
+const int numReadings = 10;
+float tempReadings[numReadings];  
 int tempIndex = 0;
 float total = 0;
 
-// Pulse Sensor
-volatile int BPM;
-volatile boolean QS = false;
-int pulsePin = A0;
-volatile unsigned long lastBeatTime = 0;
+volatile unsigned long lastBeatTime = 0;  
 
-// Pulse ISR Variables
-static int Signal, IBI = 600, lastBeatTimeISR = 0;
-static int P = 512, T = 512, thresh = 525, amp = 100;
-static boolean Pulse, firstBeat = true, secondBeat = false;
-static int rate[10];
-static unsigned long sampleCounter = 0;
-
-void setup() {
+void setup() 
+{
   Serial.begin(115200);
-  espSerial.begin(9600);
-  Wire.begin();
-  
-  // LCD Setup
   lcd.init();
   lcd.backlight();
   lcd.clear();
+
   lcd.setCursor(4, 0);
   lcd.print("BPM: --");
+
   lcd.setCursor(3, 1);
   lcd.print("TEMP: --C");
 
-  // Temperature Initialization
   tempEstimate = getInitialTemperature();
-  for (int i = 0; i < numReadings; i++) {
-    tempReadings[i] = tempEstimate;
-  }
-  total = tempEstimate * numReadings;
 
-  // Pulse Sensor Interrupt
+  for (int i = 0; i < numReadings; i++) 
+  {
+    tempReadings[i] = tempEstimate; 
+  }
+
+  total = tempEstimate * numReadings;  
+
   interruptSetup();
-
-  // RTC Setup
-  Rtc.Begin();
-  #if defined(WIRE_HAS_TIMEOUT)
-    Wire.setWireTimeout(3000, true);
-  #endif
-  if (!Rtc.IsDateTimeValid()) {
-    Rtc.SetDateTime(RtcDateTime(__DATE__, __TIME__));
-  }
-
-  // Servo Initialization
-  myservo.attach(SERVO_PIN);
-  myservo.write(78);
-  delay(500);
-  myservo.detach();
-
-  pinMode(PIR_SENSOR_PIN, INPUT);
-  pinMode(enableRightMotor, OUTPUT);
-  pinMode(rightMotorPin1, OUTPUT);
-  pinMode(rightMotorPin2, OUTPUT);
-  pinMode(enableLeftMotor, OUTPUT);
-  pinMode(leftMotorPin1, OUTPUT);
-  pinMode(leftMotorPin2, OUTPUT);
-  pinMode(IR_SENSOR_RIGHT, INPUT);
-  pinMode(IR_SENSOR_LEFT, INPUT);
-  rotateMotor(0, 0);
 }
 
-void loop() {
-  static unsigned long lastSensorUpdate = 0;
-  if(millis() - lastSensorUpdate >= 200) {
-    float temperature = getKalmanFilteredTemp();
-    total -= tempReadings[tempIndex];
-    tempReadings[tempIndex] = temperature;
-    total += tempReadings[tempIndex];
-    tempIndex = (tempIndex + 1) % numReadings;
-    tempSmooth = total / numReadings;
+void loop() 
+{
+  float temperature = getKalmanFilteredTemp();
 
-    const float smoothingFactor = 0.2;
-    tempSmooth = smoothingFactor * tempSmooth + (1 - smoothingFactor) * tempSmooth;
+  // Apply moving average smoothing
+  total -= tempReadings[tempIndex]; 
+  tempReadings[tempIndex] = temperature; 
+  total += tempReadings[tempIndex]; 
+  tempIndex = (tempIndex + 1) % numReadings;  
+  tempSmooth = total / numReadings;
 
-    lcd.setCursor(8, 1);
-    lcd.print("    ");
-    lcd.setCursor(8, 1);
-    lcd.print(tempSmooth, 1);
-    lcd.write(0xDF);
-    lcd.print("C");
+  lcd.setCursor(8, 1);
+  lcd.print("    "); 
+  lcd.setCursor(8, 1);
+  lcd.print(tempSmooth, 1);
+  lcd.print((char)223);
+  lcd.print("C");
 
-    lastSensorUpdate = millis();
-  }
-
-  if (QS) {
+  if (QS == true) 
+  { 
     serialOutputWhenBeatHappens();
     QS = false;
   }
 
-  static unsigned long lastSend = 0;
-  if(millis() - lastSend >= 1000) {
-    if (BPM >= 40 && BPM <= 115) {
-        espSerial.print("BPM:");
-        espSerial.print(BPM);
-    } else {
-        espSerial.print("BPM: --");
-    }
-    espSerial.print(",TEMP:");
-    espSerial.println(tempSmooth);
-    
-    RtcDateTime now = Rtc.GetDateTime();
-    printTime(now);
-    
-    if(now.Hour() == TRIGGER_HOUR && 
-       now.Minute() == TRIGGER_MINUTE && 
-       !servoActivated) {
-      activateServo();
-      servoActivated = true;
-      lastActivation = millis();
-    }
-    lastSend = millis();
+  boolean validPulse = (lastBeatTime != 0) && ((millis() - lastBeatTime) < PULSE_TIMEOUT);
+
+  bool tempAlert = (tempSmooth > 38 || tempSmooth < 25);
+  bool bpmAlert = (BPM > 150 || (BPM < 40 && BPM != 0)) && validPulse;
+  
+  if (tempAlert || bpmAlert) 
+  {
+    tone(BUZZER_PIN, 1000, 500);
+    delay(600);
+    tone(BUZZER_PIN, 1000, 500);
+  } 
+  else 
+  {
+    noTone(BUZZER_PIN); 
   }
 
-  if(servoActivated && (millis() - lastActivation > TRAY_HOLD_TIME + 5000)) {
-    servoActivated = false;
-    myservo.detach();
-  }
-
-// Temperature Functions
-float getInitialTemperature() {
-  float sum = 0;
-  for(int i = 0; i < 10; i++) {
-    sum += analogRead(tempPin) * 0.48828125;
-    delay(50);
-  }
-  return sum / 10;
+  delay(1000);
 }
 
-float getKalmanFilteredTemp() {
-  float rawTemp = analogRead(tempPin) * 0.48828125;
-  tempEstimate += kalmanGain * (rawTemp - tempEstimate);
+float getInitialTemperature() 
+{
+  float sum = 0;
+  int numReadings = 10;
+  
+  for (int i = 0; i < numReadings; i++) 
+  {
+    sum += readRawTemperature();
+    delay(50); 
+  }
+  
+  return sum / numReadings; 
+}
+
+float getKalmanFilteredTemp() 
+{
+  float rawTemp = readRawTemperature();
+  tempEstimate = tempEstimate + kalmanGain * (rawTemp - tempEstimate);
   return tempEstimate;
 }
 
-// Pulse ISR
-ISR(TIMER2_COMPA_vect) {
+float readRawTemperature() 
+{
+  int rawValue = analogRead(tempPin);
+  float voltage = rawValue * (5.0 / 1023.0);
+
+  float temperature = (voltage * 100); 
+  return temperature;
+}
+
+void serialOutputWhenBeatHappens() 
+{  
+  Serial.print("BPM: ");
+  Serial.println(BPM);
+
+  lcd.setCursor(8, 0);
+  lcd.print("    ");
+  lcd.setCursor(8, 0);
+  lcd.print(BPM);
+}
+
+void interruptSetup() 
+{     
+  TCCR1A = 0;               
+  TCCR1B = (1 << WGM12);       
+  TCCR1B |= (1 << CS12);       
+  OCR1A = 0x7C;                
+  TIMSK1 = (1 << OCIE1A);      
+  sei();
+}
+
+ISR(TIMER1_COMPA_vect) 
+{  
+  static int P = 512, T = 512, thresh = 525, amp = 100;
+  static boolean Pulse = false, firstBeat = true, secondBeat = false;
+  static int rate[10];
+  static unsigned long sampleCounter = 0;
+
   Signal = analogRead(pulsePin);
   sampleCounter += 2;
   int N = sampleCounter - lastBeatTimeISR;
 
-  if (Signal < thresh && N > (IBI/5)*3) {
-    if (Signal < T) T = Signal;
+  if (Signal < thresh && N > (IBI/5)*3) 
+  {      
+    if (Signal < T) { T = Signal; }
   }
 
-  if (Signal > thresh && Signal > P) P = Signal;
+  if (Signal > thresh && Signal > P)
+  { 
+    P = Signal; 
+  }                                        
 
-  if (N > 250) {
-    if (Signal > thresh && !Pulse && N > (IBI/5)*3) {
+  if (N > 250) 
+  {                                   
+    if ((Signal > thresh) && (!Pulse) && (N > (IBI/5)*3)) 
+    {        
       Pulse = true;
       IBI = sampleCounter - lastBeatTimeISR;
       lastBeatTimeISR = sampleCounter;
-      lastBeatTime = millis();
 
-      if (secondBeat) {
-        secondBeat = false;
-        for (int i = 0; i < 10; i++) rate[i] = IBI;
+      lastBeatTime = millis(); 
+      
+      if (secondBeat) 
+      {                        
+        secondBeat = false;                  
+        for (int i = 0; i <= 9; i++) { rate[i] = IBI; }
       }
-
-      if (firstBeat) {
-        firstBeat = false;
-        secondBeat = true;
-        return;
+  
+      if (firstBeat) 
+      {                         
+        firstBeat = false;                   
+        secondBeat = true;                   
+        sei();                               
+        return;                              
+      }   
+    
+      word runningTotal = 0;                    
+      for (int i = 0; i <= 8; i++) 
+      {                
+        rate[i] = rate[i+1];                   
+        runningTotal += rate[i];              
       }
+      rate[9] = IBI;                          
+      runningTotal += rate[9];                
+      runningTotal /= 10;                     
+      BPM = 60000 / runningTotal;               
 
-      word runningTotal = 0;
-      for (int i = 0; i < 9; i++) {
-        rate[i] = rate[i + 1];
-        runningTotal += rate[i];
+      if (BPM >= 50 && BPM <= 150) 
+      { 
+        QS = true;
       }
-      rate[9] = IBI;
-      runningTotal += rate[9];
-      BPM = 60000/(runningTotal/10);
-
-      if (BPM >= 40 && BPM <= 120) QS = true;
     }
   }
-
-  if (Signal < thresh && Pulse) {
-    Pulse = false;
-    amp = P - T;
-    thresh = amp/2 + T;
-    P = T = thresh;
+  
+  if (Signal < thresh && Pulse) 
+  {           
+    Pulse = false;                         
+    amp = P - T;                           
+    thresh = amp / 2 + T;                  
+    P = thresh;                            
+    T = thresh;                            
   }
 
-  if (N > 2500) {
-    thresh = 512;
-    P = 512;
-    T = 512;
-    lastBeatTimeISR = sampleCounter;
-    firstBeat = true;
-    secondBeat = false;
+  if (N > 2500) 
+  {                            
+    thresh = 512;                            
+    P = 512;                                
+    T = 512;                                
+    lastBeatTimeISR = sampleCounter;           
+    firstBeat = true;                       
+    secondBeat = false;                    
   }
-}
-
-void interruptSetup() {
-  TCCR2A = (1 << WGM21);
-  TCCR2B = (1 << CS22) | (1 << CS20);
-  OCR2A = 249;
-  TIMSK2 = (1 << OCIE2A);
-  sei();
-}
-
-void activateServo() {
-  Serial.println("\n=== MEDICATION TIME ===");
-  myservo.attach(SERVO_PIN);
-  TIMSK2 &= ~(1 << OCIE2A);
-
-  for (int pos = 78; pos <= 170; pos++) {
-    myservo.write(pos);
-    delay(30);
-  }
-  delay(TRAY_HOLD_TIME);
-  for (int pos = 170; pos >= 78; pos--) {
-    myservo.write(pos);
-    delay(30);
-  }
-
-  TIMSK2 |= (1 << OCIE2A);
-  myservo.detach();
-}
-
-void serialOutputWhenBeatHappens() {
-  if (BPM >= 40 && BPM <= 115) {
-    Serial.print("BPM: ");
-    Serial.println(BPM);
-    lcd.setCursor(8, 0);
-    lcd.print("    ");
-    lcd.setCursor(8, 0);
-    lcd.print(BPM);
-  }
-}
-
-void printTime(const RtcDateTime& dt) {
-  char buf[20];
-  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", dt.Hour(), dt.Minute(), dt.Second());
-  Serial.println(buf);
 }
