@@ -1,5 +1,3 @@
-// WHAT IS LEFT: have to add another ULTRASONIC sensor make the robot follow the line back to its original starting point.
-
 #include <Wire.h>
 #include <RTClib.h>
 #include <Servo.h>
@@ -8,17 +6,20 @@ RTC_DS3231 rtc;
 Servo trayServo; 
 Servo usServo;  
 
+#define BUZZER_PIN 2
+
 // Medication Tray pin config
 const int TRAY_SERVO_PIN = 13;
-const int MEDICATION_HOUR = 17;     // Set medication hour
-const int MEDICATION_MINUTE = 55;   // Set medication minute
+const int MEDICATION_HOUR = 9;     // Set medication hour
+const int MEDICATION_MINUTE = 18;   // Set medication minute
 const int TRAY_HOLD_TIME = 15000;   // 15 seconds
 bool trayActivated = false;
+bool beepPlayed = false;
 unsigned long lastTrayActivation = 0;
 
 // Bot Activation Configuration
-const int BOT_HOUR = 17;            // Set bot start hour
-const int BOT_MINUTE = 50;           // Set bot start minute
+const int BOT_HOUR =9;            // Set bot start hour
+const int BOT_MINUTE = 17;           // Set bot start minute
 bool botActive = false;
 bool botTriggered = false;          
 int lastDay = -1;                   
@@ -34,9 +35,9 @@ int lastDay = -1;
 #define R_S A1  // Right IR sensor
 #define echoPin A2
 #define trigPin A3
-#define US_SERVO_PIN A6  
+#define US_SERVO_PIN A7  
 
-int Set = 15; 
+int Set = 10; 
 int distance_L, distance_F, distance_R;
 
 // Motor calibration
@@ -48,6 +49,10 @@ void setup()
  {
   Serial.begin(115200);
   
+   // Initialize Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);  
+
   // Initialize RTC
   Wire.begin();
   if (!rtc.begin()) {
@@ -58,7 +63,7 @@ void setup()
   if (rtc.lostPower())
   {
     Serial.println("RTC reset to compile time");
-    rtc.adjust(DateTime(F(_DATE), F(TIME_)));
+    rtc.adjust(DateTime(__DATE__, __TIME__));
   }
 
   // Initialize Medication Tray Servo
@@ -158,7 +163,12 @@ void activateTray()
   }
   Serial.println("Tray open");
   
-  delay(TRAY_HOLD_TIME);
+  // Play sound repeatedly every 3 seconds while tray is open
+  unsigned long startTime = millis();
+  while (millis() - startTime < TRAY_HOLD_TIME) {
+    playNotificationSound();
+    delay(3000);  // 3-second delay between sounds
+  }
   
   for (int pos = 170; pos >= 78; pos--) 
   {
@@ -167,6 +177,16 @@ void activateTray()
   }
   Serial.println("Tray closed");
   trayServo.detach();
+}
+
+void playNotificationSound() {
+  // Play "teek teek" pattern
+  for (int i = 0; i < 2; i++) {
+    tone(BUZZER_PIN, 1200);  // 1200Hz tone
+    delay(200);              // Beep duration
+    noTone(BUZZER_PIN);
+    delay(200);              // Pause between beeps
+  }
 }
 
 void printTime(const DateTime& dt) 
@@ -206,8 +226,19 @@ void runBot() {
   }
   else 
   {
-    moveMotors(0, 0);              
+    moveMotors(0, 0);   
+
+    Serial.println("Horizontal black line detected. Stopping...");
+  
+  // Play a short beep
+  if (!beepPlayed) { 
+    tone(BUZZER_PIN, 1000);  
+    delay(500);             
+    noTone(BUZZER_PIN);
+    beepPlayed = true;
+  
   }
+}
   delay(10);
 }
 
@@ -302,27 +333,27 @@ void avoidObstacle()
   if (distance_L > distance_R) 
   {
     moveMotors(-MOTOR_SPEED, MOTOR_SPEED);  
-    delay(500);
+    delay(620);
     moveMotors(MOTOR_SPEED, MOTOR_SPEED);   
-    delay(600);
+    delay(720);
     moveMotors(MOTOR_SPEED, -MOTOR_SPEED);  
-    delay(500);
+    delay(620);
     moveMotors(MOTOR_SPEED, MOTOR_SPEED);   
-    delay(600);
+    delay(720);
     moveMotors(MOTOR_SPEED, -MOTOR_SPEED);  
-    delay(400);
+    delay(520);
   } 
   else 
   {
     moveMotors(MOTOR_SPEED, -MOTOR_SPEED);  
-    delay(500);
+    delay(620);
     moveMotors(MOTOR_SPEED, MOTOR_SPEED);    
-    delay(600);
+    delay(720);
     moveMotors(-MOTOR_SPEED, MOTOR_SPEED);   
-    delay(500);
+    delay(620);
     moveMotors(MOTOR_SPEED, MOTOR_SPEED);    
-    delay(600);
+    delay(720);
     moveMotors(-MOTOR_SPEED, MOTOR_SPEED);   
-    delay(400);
+    delay(520);
   }
 }
